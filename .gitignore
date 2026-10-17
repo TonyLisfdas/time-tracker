@@ -1,0 +1,9 @@
+﻿data/
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pid
+*.pid.lock
+time_report_*.html
