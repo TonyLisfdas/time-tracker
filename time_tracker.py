@@ -152,13 +152,33 @@ def load_rules():
         # utf-8-sig：兼容记事本 / PowerShell 另存为时附加的 BOM
         with open(RULES_PATH, encoding="utf-8-sig") as f:
             cfg = json.load(f)
-        exe_rules.update({k.lower(): v for k, v in cfg.get("exe", {}).items()})
-        for kws, cat in cfg.get("title", []):
-            title_rules.append((kws, cat))
+        if not isinstance(cfg, dict):
+            raise ValueError("规则文件顶层必须是 JSON 对象")
+        exe_cfg = cfg.get("exe", {})
+        if isinstance(exe_cfg, dict):
+            exe_rules.update({str(k).lower(): v for k, v in exe_cfg.items()})
+        else:
+            _warn("⚠️ 规则文件 exe 段不是对象，已跳过该段")
+        # 自定义标题规则放在默认规则之前：subcategory_of 首命中即返回，
+        # 只有这样用户才能覆盖默认分类；坏条目逐条跳过，不牵连其他规则。
+        custom_title = []
+        title_cfg = cfg.get("title", [])
+        if isinstance(title_cfg, list):
+            for entry in title_cfg:
+                try:
+                    kws, cat = entry
+                    if not isinstance(kws, (list, tuple)) or not kws:
+                        raise ValueError("关键词必须是非空列表")
+                    custom_title.append(([str(k) for k in kws], str(cat)))
+                except Exception as e:
+                    _warn(f"⚠️ 跳过格式错误的标题规则 {entry!r}（{e}）")
+        else:
+            _warn("⚠️ 规则文件 title 段不是列表，已跳过该段")
+        title_rules = custom_title + title_rules
     except FileNotFoundError:
         pass  # 规则文件不存在是正常的
     except Exception as e:
-        _warn(f"⚠️ 规则文件加载失败（{e}），使用默认规则")
+        _warn(f"⚠️ 规则文件加载失败（{e}），已加载部分可能不完整，其余使用默认规则")
     return exe_rules, title_rules
 
 
@@ -203,7 +223,8 @@ def classify(exe, title, exe_rules, title_rules):
     """返回 (主类别, 子类别)。子类别是更细的归属（视频/网购/具体AI产品等）。
     对浏览器和「其他」类别都尝试 title_rules 提升。"""
     sub = subcategory_of(title, exe_rules, title_rules)
-    cat = exe_rules.get(exe.lower(), "其他")
+    # exe 允许为 None / 空（取窗口信息失败时 win_info 可能给不出进程名）
+    cat = exe_rules.get((exe or "").lower(), "其他")
     if sub:
         if cat == "上网浏览":
             promo = _promote(sub)
@@ -275,6 +296,96 @@ def pid_alive(pid):
     return alive
 
 
+def _proc_creation_token(pid):
+    """进程创建时间的整数标记（Windows FILETIME），取不到返回 None。
+
+    PID 会被系统回收复用，只存 PID 时 stale 的 PID 文件可能指向无关进程。
+    写入时把创建时间一并存下，停止时核对，可避免误杀被复用的 PID。
+    """
+    if not _kernel32:
+        return None
+    handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        dummy = wintypes.FILETIME()
+        ok = _kernel32.GetProcessTimes(handle, ctypes.byref(creation),
+                                       ctypes.byref(dummy), ctypes.byref(dummy),
+                                       ctypes.byref(dummy))
+        if not ok:
+            return None
+        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    except Exception:
+        return None
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def _proc_image_basename(pid):
+    """进程可执行文件名（小写 basename），取不到返回 None。"""
+    if not _kernel32:
+        return None
+    handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if _kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value).lower()
+        return None
+    except Exception:
+        return None
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+_PYTHON_IMAGES = {"python.exe", "pythonw.exe", "py.exe", "pyw.exe"}
+
+
+def _write_pid_file(path, pid):
+    """写 PID 文件：新格式为 ``pid|创建时间标记``，标记取不到时只写 pid。"""
+    token = _proc_creation_token(pid)
+    text = f"{pid}|{token}" if token is not None else str(pid)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _read_pid_file(path):
+    """读 PID 文件并校验它仍指向当初那个进程。
+
+    返回 PID（校验通过）或 None（文件缺失/进程已退出/疑似 PID 被复用）。
+    旧格式（只有 pid、无创建时间标记）退而求其次：要求进程映像是 Python，
+    避免对明显无关的进程执行 taskkill。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    pid_text, sep, token_text = raw.partition("|")
+    try:
+        pid = int(pid_text.strip())
+    except ValueError:
+        return None
+    if not pid_alive(pid):
+        return None
+    if sep:
+        try:
+            expected = int(token_text.strip())
+        except ValueError:
+            return None
+        # 标记对不上 = PID 已被另一个进程复用，绝不能杀
+        return pid if _proc_creation_token(pid) == expected else None
+    image = _proc_image_basename(pid)
+    if image is not None and image not in _PYTHON_IMAGES:
+        return None
+    return pid
+
+
 # ---------- 数据库 ----------
 
 _DB_SCHEMA_VERSION = 2  # 每次 schema 变更时递增
@@ -282,10 +393,15 @@ _DB_SCHEMA_VERSION = 2  # 每次 schema 变更时递增
 
 def get_conn():
     """获取数据库连接。启用 WAL 模式，schema 迁移仅在版本变化时执行。"""
-    # 确保父目录存在
-    os.makedirs(DB_DIR, exist_ok=True)
+    # 每次现算目录：DB_PATH 可能被环境变量/测试改写，不能用导入时算死的
+    # DB_DIR，否则目录不存在时会报 unable to open database file。
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(db_dir, exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH)
+    # timeout / busy_timeout：监控与手动命令、报告可能并发访问同一库，
+    # 没有等待超时时容易直接抛 database is locked。
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
 
     # 检查并执行 schema 迁移
@@ -316,7 +432,7 @@ def get_conn():
         for rid, name, cat in rows:
             sub = subcategory_of(name, exe_rules, title_rules)
             new_cat = cat
-            if sub and cat == "上网浏览":
+            if sub and cat in ("上网浏览", "其他"):
                 promo = _promote(sub)
                 if promo:
                     new_cat = promo
@@ -357,7 +473,9 @@ def reclassify():
     for rid, name, cat in rows:
         sub = subcategory_of(name, exe_rules, title_rules)
         new_cat = cat
-        if sub and cat == "上网浏览":
+        # 与 classify() 口径一致：「上网浏览」和「其他」都按标题提升，
+        # 否则未知程序 + AI/视频标题的历史记录永远修不到正确类别。
+        if sub and cat in ("上网浏览", "其他"):
             promo = _promote(sub)
             if promo:
                 new_cat = promo
@@ -409,16 +527,49 @@ def _open_event(conn, name, category, now, sub=None):
     conn.commit()
 
 
+def _day_bounds(day):
+    """某天（YYYY-MM-DD）的 [00:00, 次日00:00) datetime 边界。"""
+    start = datetime.fromisoformat(day + "T00:00:00")
+    return start, start + timedelta(days=1)
+
+
 def fetch_day(conn, day):
+    """取某天的事件，跨天事件按午夜切分、只计入落在该天的部分。
+
+    以前按 date(start_time) 全额记在开始日：23:00→01:00 的事件会让
+    昨天多 2 小时、今天 0，且与 HTML 时间线的裁剪口径不一致。
+    现在返回的 start/end 也被裁到该天范围内，duration 为裁剪后秒数。
+    """
+    day_start, day_end = _day_bounds(day)
+    # 先按 start_time 粗筛（ISO 文本可直接比较），再在 Python 里精确裁剪
     cur = conn.execute(
         """SELECT name, category, start_time, end_time, duration_sec, subcategory
-           FROM events WHERE date(start_time) = ? ORDER BY start_time""", (day,))
+           FROM events
+           WHERE start_time < ? AND (end_time IS NULL OR end_time > ?)
+           ORDER BY start_time""",
+        (day_end.isoformat(timespec="seconds"),
+         day_start.isoformat(timespec="seconds")))
     items = []
+    now = datetime.now()
     for name, cat, st, et, dur, sub in cur.fetchall():
-        if et is None:
-            dur = max(0, int((datetime.now() - datetime.fromisoformat(st)).total_seconds()))
-        items.append({"name": name, "category": cat, "start": st,
-                      "end": et, "duration": max(0, dur), "sub": sub})
+        try:
+            s_dt = datetime.fromisoformat(st)
+            e_dt = datetime.fromisoformat(et) if et else now
+        except ValueError:
+            continue  # 时间戳损坏的记录跳过，不能让整份报告崩掉
+        seg_start = max(s_dt, day_start)
+        seg_end = min(e_dt, day_end)
+        if seg_end < seg_start:
+            continue
+        items.append({
+            "name": name, "category": cat,
+            "start": seg_start.isoformat(timespec="seconds"),
+            # 未结束事件在当天视图里仍标为未结束（None），便于显示「进行中」
+            "end": (et if e_dt < day_end else day_end.isoformat(timespec="seconds"))
+                   if et else None,
+            "duration": max(0, int((seg_end - seg_start).total_seconds())),
+            "sub": sub,
+        })
     return items
 
 
@@ -446,7 +597,8 @@ def stop_event():
 def status():
     conn = get_conn()
     row = conn.execute(
-        "SELECT name, category, start_time FROM events WHERE end_time IS NULL ORDER BY start_time LIMIT 1").fetchone()
+        "SELECT name, category, start_time FROM events WHERE end_time IS NULL "
+        "ORDER BY start_time DESC LIMIT 1").fetchone()
     if not row:
         print("💤 当前没有正在记录的事件")
         return
@@ -494,8 +646,62 @@ def _build_analysis(items):
             "sorted_subs": sorted(sub_dur.items(), key=lambda x: -x[1]),
             "sorted_events": sorted(event_dur.items(), key=lambda x: -x[1]),
             "event_cnt": event_cnt,
-            "longest": max(items, key=lambda x: x["duration"]),
+            "longest": max(items, key=lambda x: x["duration"]) if items else None,
             "avg": total / len(items) if items else 0}
+
+
+def day_report_data(day=None, trend_days=7):
+    """结构化日报数据：原生窗口（gui 命令）与测试共用，不依赖浏览器/HTML。
+
+    返回 dict：day / items / total / sorted_cats / sorted_subs /
+    sorted_events / event_cnt / longest / avg / is_summarized /
+    trend（最近 trend_days 天，含当天锚点往前，每项 {day,total,cats}）。
+    当天无明细但已有每日汇总时，用汇总合成 items 并置 is_summarized。
+    """
+    day = day or date.today().isoformat()
+    conn = get_conn()
+    try:
+        items = fetch_day(conn, day)
+        is_summarized = False
+        if not items:
+            rows = conn.execute(
+                "SELECT category, total_sec FROM daily_summaries WHERE day=?",
+                (day,)).fetchall()
+            if rows:
+                is_summarized = True
+                items = [{"name": f"[{cat}] 汇总", "category": cat,
+                          "start": day + "T00:00:00", "end": day + "T23:59:59",
+                          "duration": dur, "sub": None} for cat, dur in rows]
+        data = _build_analysis(items) if items else {
+            "total": 0, "sorted_cats": [], "sorted_subs": [],
+            "sorted_events": [], "event_cnt": {}, "longest": None, "avg": 0}
+        data.update({"day": day, "items": items,
+                     "is_summarized": is_summarized})
+
+        # 近 trend_days 天趋势：逐日复用 fetch_day（按午夜切分、口径与
+        # 当天明细一致）；某天明细已全部被清理时回落到每日汇总。
+        trend = []
+        cur = date.fromisoformat(day) - timedelta(days=trend_days - 1)
+        anchor = date.fromisoformat(day)
+        while cur <= anchor:
+            iso = cur.isoformat()
+            day_items = items if iso == day else fetch_day(conn, iso)
+            cats = {}
+            for it in day_items:
+                cats[it["category"]] = cats.get(it["category"], 0) \
+                    + it["duration"]
+            if not cats:
+                for cat, sec in conn.execute(
+                        "SELECT category, total_sec FROM daily_summaries "
+                        "WHERE day=?", (iso,)).fetchall():
+                    cats[cat] = cats.get(cat, 0) + (sec or 0)
+            trend.append({"day": iso, "total": sum(cats.values()),
+                          "cats": cats})
+            cur += timedelta(days=1)
+        data["trend"] = trend
+        return data
+    finally:
+        conn.close()
 
 
 def _print_tips(a, total):
@@ -582,13 +788,36 @@ SUMMARY_RETAIN_MONTHS = _CFG["daily_retain_months"]   # 0 = 每日汇总永不�
 AGGREGATE_AFTER_DAYS = max(1, _CFG["aggregate_after_days"])
 
 
+def _months_ago_ym(today, months):
+    """today 往前 months 个月的 YYYY-MM（删除每日汇总的界）。
+
+    以 0 起的月份序号计算，避免旧写法的 ``ym % 12`` 在整除时
+    生成 ``2026-00`` 这种非法月份、进而多删一个月数据。
+    """
+    total = today.year * 12 + (today.month - 1) - months
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
 def summarize(verbose=True):
     """逐级汇总：原始事件→每日汇总→每月汇总；仅在保留期 > 0 时才清理超期数据。
 
     保留期来自 data\\time_tracker_config.json，默认 0 = 永久保留，
     即每天明细一直留着，随时可按任意区间做周/月/年统计。
+
+    汇总口径（v2.1 修正）：
+    - 每次对界内天/月 **无条件重算** 并先删后插，补录、reclassify、
+      事件事后才关闭等变化都能反映进汇总，不会像旧版那样首汇后冻结；
+    - 仍有未结束事件的天不汇总（duration 还没定型）；
+    - 跨天事件按午夜切分（复用 fetch_day 口径），不再全额记开始日。
     """
     conn = get_conn()
+    try:
+        return _summarize_conn(conn, verbose=verbose)
+    finally:
+        conn.close()
+
+
+def _summarize_conn(conn, verbose=True):
     today = date.today()
 
     # 汇总口径：过完的整天都要汇总，与保留期无关（否则保留期=0 时永远不出汇总）
@@ -600,50 +829,83 @@ def summarize(verbose=True):
     # 删除口径：0（或负数）表示永久保留，不删
     del_day_cutoff = ((today - timedelta(days=SUMMARY_RETAIN_DAYS)).isoformat()
                       if SUMMARY_RETAIN_DAYS > 0 else None)
-    if SUMMARY_RETAIN_MONTHS > 0:
-        ym = today.year * 12 + today.month - SUMMARY_RETAIN_MONTHS
-        del_month_cutoff = f"{ym // 12:04d}-{ym % 12:02d}"
-    else:
-        del_month_cutoff = None
+    del_month_cutoff = (_months_ago_ym(today, SUMMARY_RETAIN_MONTHS)
+                        if SUMMARY_RETAIN_MONTHS > 0 else None)
 
-    # 1) 找出需要汇总的天（原始事件存在且未汇总）
-    days_to_sum = conn.execute(
-        "SELECT DISTINCT date(start_time) AS d FROM events "
-        "WHERE date(start_time) <= ? "
-        "AND date(start_time) NOT IN (SELECT DISTINCT day FROM daily_summaries)",
-        (agg_day_cutoff,)).fetchall()
-    days_to_sum = [r[0] for r in days_to_sum]
+    # 1) 需要（重）汇总的天：界内有事件片段的天 ∪ 界内已有汇总的天
+    #    （后者保证事件被删/改类后旧汇总行也能被清掉重算）。
+    #    跨天事件会给每一天都贡献片段，候选天必须逐日展开，
+    #    只取 date(start_time) 会漏掉跨天事件的次日片段。
+    cutoff_date = date.fromisoformat(agg_day_cutoff)
+
+    def _segment_days(st, et):
+        try:
+            cur = datetime.fromisoformat(st)
+            end = datetime.fromisoformat(et) if et else datetime.now()
+        except ValueError:
+            return set()
+        limit = min(end, datetime.combine(cutoff_date + timedelta(days=1),
+                                           datetime.min.time()))
+        days = set()
+        while cur < limit:
+            days.add(cur.date().isoformat())
+            cur = datetime.combine(cur.date() + timedelta(days=1),
+                                   datetime.min.time())
+        return days
+
+    event_days = set()
+    for st, et in conn.execute(
+            "SELECT start_time, end_time FROM events "
+            "WHERE end_time IS NOT NULL AND date(start_time) <= ?",
+            (agg_day_cutoff,)).fetchall():
+        event_days |= _segment_days(st, et)
+    summary_days = {r[0] for r in conn.execute(
+        "SELECT DISTINCT day FROM daily_summaries WHERE day <= ?",
+        (agg_day_cutoff,)).fetchall()}
+    # 仍有未结束事件覆盖的天不汇总，等事件关闭后再汇
+    open_days = set()
+    for (st,) in conn.execute(
+            "SELECT start_time FROM events WHERE end_time IS NULL").fetchall():
+        open_days |= _segment_days(st, None)
+    days_to_sum = sorted((event_days | summary_days) - open_days)
 
     daily_rows = 0
     for d in days_to_sum:
-        rows = conn.execute(
-            "SELECT category, SUM(duration_sec), COUNT(*) FROM events "
-            "WHERE date(start_time) = ? GROUP BY category", (d,)).fetchall()
-        for cat, total, cnt in rows:
+        # fetch_day 已按午夜裁剪且只含已结束（或按 now 计）的片段；
+        # open 天已在上面剔除，这里不会把未定型的 0 秒事件汇进去。
+        items = [it for it in fetch_day(conn, d) if it["end"] is not None]
+        conn.execute("DELETE FROM daily_summaries WHERE day = ?", (d,))
+        by_cat = {}
+        for it in items:
+            total, cnt = by_cat.get(it["category"], (0, 0))
+            by_cat[it["category"]] = (total + it["duration"], cnt + 1)
+        for cat, (total, cnt) in by_cat.items():
             conn.execute(
-                "INSERT OR REPLACE INTO daily_summaries "
+                "INSERT INTO daily_summaries "
                 "(day, category, total_sec, event_count) VALUES (?,?,?,?)",
                 (d, cat, total, cnt))
             daily_rows += 1
 
-    # 2) 找出需要汇总的月（每日汇总存在且未汇总）
-    months_to_sum = conn.execute(
+    # 2) 需要（重）汇总的月：界内有每日汇总的月 ∪ 界内已有每月汇总的月
+    daily_months = [r[0] for r in conn.execute(
         "SELECT DISTINCT substr(day,1,7) AS m FROM daily_summaries "
-        "WHERE substr(day,1,7) <= ? "
-        "AND substr(day,1,7) NOT IN (SELECT DISTINCT month FROM monthly_summaries)",
-        (agg_month_cutoff,)).fetchall()
-    months_to_sum = [r[0] for r in months_to_sum]
+        "WHERE substr(day,1,7) <= ?", (agg_month_cutoff,)).fetchall()]
+    summary_months = [r[0] for r in conn.execute(
+        "SELECT DISTINCT month FROM monthly_summaries WHERE month <= ?",
+        (agg_month_cutoff,)).fetchall()]
+    months_to_sum = sorted({m for m in daily_months + summary_months if m})
 
     monthly_rows = 0
     for m in months_to_sum:
         rows = conn.execute(
             "SELECT category, SUM(total_sec), COUNT(DISTINCT day) FROM daily_summaries "
             "WHERE substr(day,1,7) = ? GROUP BY category", (m,)).fetchall()
+        conn.execute("DELETE FROM monthly_summaries WHERE month = ?", (m,))
         for cat, total, dcnt in rows:
             conn.execute(
-                "INSERT OR REPLACE INTO monthly_summaries "
+                "INSERT INTO monthly_summaries "
                 "(month, category, total_sec, day_count) VALUES (?,?,?,?)",
-                (m, cat, total, dcnt))
+                (m, cat, total or 0, dcnt))
             monthly_rows += 1
 
     # 3) 清理超期原始事件（仅当保留天数 > 0）
@@ -734,7 +996,8 @@ def retention_show():
              if os.path.exists(DB_PATH + '-wal') else ""))
     if n:
         rec_hours = conn.execute(
-            "SELECT SUM(duration_sec) FROM events WHERE end_time IS NOT NULL"
+            "SELECT COALESCE(SUM(duration_sec), 0) FROM events "
+            "WHERE end_time IS NOT NULL"
         ).fetchone()[0] / 3600.0
         rate = n / rec_hours if rec_hours > 0.2 else None
         head = f"  明细 {n} 条（{span[0]} ~ {span[1]}）"
@@ -1251,12 +1514,8 @@ def html_report(day=None, open_it=False):
 # ---------- 实时报告服务 ----------
 
 def _serve_pid():
-    try:
-        with open(SERVE_PID_PATH, encoding="utf-8") as f:
-            pid = int(f.read().strip())
-        return pid if pid_alive(pid) else None
-    except Exception:
-        return None
+    # 含创建时间标记校验：PID 被复用时返回 None，serve_stop 不会误杀
+    return _read_pid_file(SERVE_PID_PATH)
 
 
 def serve_stop():
@@ -1314,8 +1573,7 @@ def serve_report(port=8765, day=None, background=True):
                 args, stdout=logf, stderr=subprocess.STDOUT,
                 creationflags=0x00000008 | 0x08000000,
                 close_fds=True)
-        with open(SERVE_PID_PATH, "w", encoding="utf-8") as f:
-            f.write(str(proc.pid))
+        _write_pid_file(SERVE_PID_PATH, proc.pid)
         print(f"✅ 实时报告服务已在后台启动（PID {proc.pid}，无窗口）")
         print(f"   访问 {url}，手动刷新即看最新数据")
         print("   停止方法：py time_tracker.py serve stop")
@@ -1351,8 +1609,7 @@ def serve_report(port=8765, day=None, background=True):
     except OSError as e:
         print(f"⚠️ 无法启动服务（端口 {port} 可能被占用）：{e}")
         return
-    with open(SERVE_PID_PATH, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+    _write_pid_file(SERVE_PID_PATH, os.getpid())
     print(f"🌐 实时报告服务已启动：{url}")
     print("   手动刷新即可看到最新数据；无操作 30 秒也会自动刷新。")
     print("   停止方法：py time_tracker.py serve stop（或 Ctrl+C）")
@@ -1522,18 +1779,13 @@ def monitor(interval=10.0, duration_min=0.0, idle_threshold=300.0,
         except ImportError:
             lock_file = None
 
-        try:
-            with open(PID_PATH, encoding="utf-8") as f:
-                old = int(f.read().strip())
-            if pid_alive(old):
-                print(f"⚠️ 监控已在运行中（PID {old}），无需重复启动")
-                if lock_file:
-                    lock_file.close()
-                return
-        except Exception:
-            pass
-        with open(PID_PATH, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+        old = _read_pid_file(PID_PATH)
+        if old:
+            print(f"⚠️ 监控已在运行中（PID {old}），无需重复启动")
+            if lock_file:
+                lock_file.close()
+            return
+        _write_pid_file(PID_PATH, os.getpid())
         if os.path.exists(STOP_FLAG):
             os.remove(STOP_FLAG)
         if lock_file:
@@ -1572,6 +1824,7 @@ def monitor(interval=10.0, duration_min=0.0, idle_threshold=300.0,
         while True:
             if _shutdown_requested:
                 break
+            cycle_start = time.monotonic()
             try:
                 if idle_seconds() >= idle_threshold:
                     key = ("离开/闲置（无键鼠操作）", "休息", None)
@@ -1618,14 +1871,11 @@ def monitor(interval=10.0, duration_min=0.0, idle_threshold=300.0,
             except Exception as e:
                 _log(f"⚠️ 单次迭代异常：{e}（继续监控）")
 
-            # deadline-based sleep 减少漂移
-            cycle_start = time.monotonic()
-            time.sleep(interval)
+            # 只睡「interval - 本轮处理耗时」，把采样周期钉在 interval 上，
+            # 避免旧写法把 cycle_start 记在 sleep 前导致第二次睡恒为 0、
+            # 处理耗时全部变成漂移累加。
             elapsed = time.monotonic() - cycle_start
-            if elapsed > interval:
-                pass  # 处理耗时超过 interval，不额外 sleep
-            else:
-                time.sleep(max(0, interval - elapsed))
+            time.sleep(max(0.0, interval - elapsed))
     except KeyboardInterrupt:
         _log("⏹ 收到 Ctrl+C")
     finally:
@@ -1644,12 +1894,8 @@ def monitor(interval=10.0, duration_min=0.0, idle_threshold=300.0,
 
 
 def _daemon_pid():
-    try:
-        with open(PID_PATH, encoding="utf-8") as f:
-            pid = int(f.read().strip())
-        return pid if pid_alive(pid) else None
-    except Exception:
-        return None
+    # 含创建时间标记校验：PID 被复用时返回 None，daemon_stop 不会误杀
+    return _read_pid_file(PID_PATH)
 
 
 def daemon_start(interval=10.0, idle_threshold=300.0):
@@ -1817,9 +2063,10 @@ def print_usage():
   默认永久保留全部明细、不自动删除；策略见 retention 命令。
 
 查询与分析：
+  gui [--day YYYY-MM-DD]    原生桌面窗口看报告（不依赖浏览器，推荐）
   today [YYYY-MM-DD]        某天做了什么、各多久（默认今天）
   report [YYYY-MM-DD]       文字分析：占比/倾向/建议
-  html [YYYY-MM-DD] [--open]  生成可视化日报（--open 自动用浏览器打开）
+  html [YYYY-MM-DD] [--open]  生成可视化日报 HTML（可选导出，需浏览器打开）
   serve [--port 8765] [--day YYYY-MM-DD]
                               后台启动本地实时报告（无窗口，仅本机访问）
   serve stop                  停止实时报告服务
@@ -1867,6 +2114,20 @@ def main():
         stop_event()
     elif cmd == "status":
         status()
+    elif cmd == "gui":
+        positional, vals = parse_flags(args, {"day": str})
+        if positional is None:
+            return
+        day = parse_day(vals["day"]) if vals.get("day") else None
+        if vals.get("day") and day is None:
+            return
+        # 延迟导入：无图形环境/服务器上跑其他命令时不依赖 tkinter 能否建窗
+        try:
+            from time_tracker_gui import launch_gui
+        except Exception as e:
+            print(f"⚠️ 无法加载原生窗口模块（{e}）")
+            return
+        launch_gui(day)
     elif cmd in ("today", "report", "chart"):
         day = parse_day(args[0]) if args else None
         if args and day is None:
@@ -1888,7 +2149,11 @@ def main():
         if positional and positional[0] == "stop":
             serve_stop()
         else:
-            serve_report(vals.get("port", 8765), vals.get("day"),
+            port = vals.get("port", 8765)
+            if not 1 <= port <= 65535:
+                print("⚠️ --port 必须在 1~65535 之间")
+                return
+            serve_report(port, vals.get("day"),
                          background=not vals.get("fg", False))
     elif cmd == "history":
         try:
@@ -1899,7 +2164,11 @@ def main():
         positional, vals = parse_flags(args, {"minutes": float, "name": str})
         if positional is None:
             return
-        pomodoro(vals.get("minutes", 25.0), vals.get("name", "番茄钟"))
+        minutes = vals.get("minutes", 25.0)
+        if minutes <= 0:
+            print("⚠️ --minutes 必须大于 0")
+            return
+        pomodoro(minutes, vals.get("name", "番茄钟"))
     elif cmd == "monitor":
         positional, vals = parse_flags(
             args, {"interval": float, "duration": float,
@@ -1907,11 +2176,22 @@ def main():
         if positional is None:
             return
         interval = vals.get("interval", 10.0)
+        idle = vals.get("idle", 300.0)
+        debounce = vals.get("debounce", 2)
+        duration = vals.get("duration", 0.0)
         if interval <= 0:
             print("⚠️ --interval 必须大于 0")
             return
-        monitor(interval, vals.get("duration", 0.0),
-                vals.get("idle", 300.0), vals.get("debounce", 2),
+        if idle < 0:
+            print("⚠️ --idle 不能为负数")
+            return
+        if debounce < 1:
+            print("⚠️ --debounce 至少为 1")
+            return
+        if duration < 0:
+            print("⚠️ --duration 不能为负数")
+            return
+        monitor(interval, duration, idle, debounce,
                 vals.get("dry-run", False))
     elif cmd == "daemon":
         if not args or args[0] not in ("start", "stop", "status"):
@@ -1921,7 +2201,15 @@ def main():
             positional, vals = parse_flags(args[1:], {"interval": float, "idle": float})
             if positional is None:
                 return
-            daemon_start(vals.get("interval", 10.0), vals.get("idle", 300.0))
+            interval = vals.get("interval", 10.0)
+            idle = vals.get("idle", 300.0)
+            if interval <= 0:
+                print("⚠️ --interval 必须大于 0")
+                return
+            if idle < 0:
+                print("⚠️ --idle 不能为负数")
+                return
+            daemon_start(interval, idle)
         elif args[0] == "stop":
             daemon_stop()
         else:
